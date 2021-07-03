@@ -1,0 +1,159 @@
+from dolfin import * 
+import numpy as np
+import numpy 
+import matplotlib.pyplot as plt
+
+list_linear_algebra_backends()
+print(parameters["linear_algebra_backend"])
+list_linear_solver_methods()
+list_krylov_solver_methods()
+list_krylov_solver_preconditioners()
+
+orderk = 2
+orderqhat= 3
+orderuhat = 3
+names = (orderk + 1)*1000 + orderk*100 + orderqhat*10 + orderuhat
+
+
+i = -1
+while (i>-2):
+    para_eta = 1
+    para_tau = 1
+    para_gamma = 1
+    d = 2
+    
+    uL2square = 1.0
+    uH1square = 3/4*pi**2
+    sigL2square = 2
+    sigAL2square = 2
+    sigDivsquare = 2
+
+    kmesh = 0
+    while (kmesh<5):
+        kkmesh = 2**kmesh
+        mesh = UnitSquareMesh(kkmesh,kkmesh)
+
+        # Source terms    
+        uD = Expression("sin(pi*x[0])*sin(pi*x[1])",degree=6)
+        f = Expression("2*pi*pi*sin(pi*x[0])*sin(pi*x[1])",degree=6)
+        sigD = Expression(("-pi*cos(pi*x[0])*sin(pi*x[1])","-pi*sin(pi*x[0])*cos(pi*x[1])"),degree=6)
+
+        # Define function spaces and mixed (product) space
+        Qelem = VectorElement("DG",mesh.ufl_cell(),orderk+1)
+        Velem = FiniteElement("DG",mesh.ufl_cell(),orderk)
+        Belemsig = FiniteElement("RT",mesh.ufl_cell(),orderqhat+1)
+        Belemu = FiniteElement("RT",mesh.ufl_cell(),orderuhat+1)  #lowest order for RT element is 1
+        element = MixedElement(Qelem, Velem, Belemsig, Belemu) 
+        W = FunctionSpace(mesh, element)
+        Q = FunctionSpace(mesh, Qelem)
+        V = FunctionSpace(mesh, Velem)
+        n = FacetNormal(mesh)
+        h = CellDiameter(mesh)
+        h_avg = (h('+') + h('-'))/2.0
+
+
+        sigI = project(sigD,Q)
+        uI = project(uD,V)
+
+        # Define Dirichlet boundary (x = 0 or x = 1)
+        def boundary(x):
+            return x[0] < DOLFIN_EPS or x[0] > 1.0 - DOLFIN_EPS
+
+        # Define boundary condition
+        u0 = Constant(0.0) 
+
+        def epsilon(u):
+            return 0.5*(nabla_grad(u) + nabla_grad(u).T)
+        
+        # Define trial and test functions 
+        (sigma, u, sighat, uhat) = TrialFunctions(W)
+        (tau, v, tauhat, vhat) = TestFunctions(W) 
+##       
+        # Define variational form 
+        a = (inner(sigma, tau) - div(tau)*u - div(sigma)*v)*dx \
+            + jump(sigma,n)*avg(v)*dS + jump(tau,n)*avg(u)*dS \
+            + 1/2*jump(sigma,n)*inner(avg(vhat),jump(n))*dS + 1/2*jump(tau,n)*inner(avg(uhat),jump(n))*dS \
+            - 1/2*jump(u)*inner(avg(tauhat),jump(n))*dS - 1/2*jump(v)*inner(avg(sighat),jump(n))*dS \
+            + para_tau/h_avg*inner(avg(sighat),jump(n))*inner(avg(tauhat),jump(n))*dS \
+            + para_tau/h*inner(sighat,n)*inner(tauhat,n)*ds \
+            - para_eta*h_avg*inner(avg(uhat),jump(n))*inner(avg(vhat),jump(n))*dS \
+            - para_eta*h*inner(uhat,n)*inner(vhat,n)*ds \
+            + para_gamma*jump(sigma,n)*jump(v)*dS + para_gamma*jump(tau,n)*jump(u)*dS
+        
+        L = -f*v*dx
+
+
+        # Compute solution
+        w = Function(W)  
+
+        #solve(a == L, w, solver_parameters=dict(linear_solver='bicgstab', preconditioner='hypre_amg'))
+        solve(a == L, w) 
+        (sigma, u, sighat, uhat) = w.split()
+
+        #############################################
+        #               Postprocess                 #
+        #############################################
+        Celem = FiniteElement("DG",mesh.ufl_cell(),0)
+        VelemStar = FiniteElement("DG",mesh.ufl_cell(),orderk+2)
+        elementStar = MixedElement(VelemStar, Celem) 
+        Vstar = FunctionSpace(mesh, elementStar)
+        (ustar, cstar) = TrialFunctions(Vstar)
+        (vstar, dstar) = TestFunctions(Vstar) 
+        apost = inner(grad(ustar), grad(vstar))*dx + cstar*vstar*dx + dstar*ustar*dx
+        Lpost2 = f*vstar*dx + dstar*u*dx  - inner(avg(sigma),jump(vstar,n))*dS - jump(vstar)*inner(avg(sighat),jump(n))*dS\
+                - inner(sigma,n)*vstar*ds + para_gamma*inner(jump(sigma,n), avg(vstar))*dS  #  inner(avg(sigma),jump(vstar,n))*dS
+        Lpost1 = f*vstar*dx + dstar*u*dx  - 1/2*inner(avg(sigma),jump(n))*jump(vstar)*dS - inner(jump(sigma,n),avg(vstar))*dS\
+                 - inner(sigma,n)*vstar*ds
+
+        ww = Function(Vstar)
+        solve(apost == Lpost2, ww)
+        (ustar,cstar) = ww.split()
+        
+        error_u_upost_L2 = assemble((uD - ustar)*(uD - ustar)*dx)
+        error_u_upost_L2 = sqrt(error_u_upost_L2) 
+        
+        #############################################
+        
+        # Compute error
+        jumpu = assemble(h_avg*jump(u)*jump(u)*dS)
+        jumpu = sqrt(jumpu)
+        jumpsig = assemble(1/h_avg*jump(sigma,n)*jump(sigma,n)*dS)
+        jumpsig = sqrt(jumpsig)
+
+        error_u_L2 = assemble((uD - u)*(uD - u)*dx)
+        error_u_L2 = sqrt(error_u_L2) 
+        
+        error_sig_L2 = assemble(inner(sigma - sigD,sigma - sigD)*dx)/sigL2square
+        error_sig_L2 = sqrt(error_sig_L2)
+        
+        error_sig_Hdiv = assemble(inner(div(sigma) - f, div(sigma) - f)*dx)/sigDivsquare
+        error_sig_Hdiv = sqrt(error_sig_Hdiv) 
+
+        error_u_uI_L2 = assemble((uI - u)*(uI - u)*dx)
+        error_u_uI_L2 = sqrt(error_u_uI_L2)
+
+        error_sig_sigI_L2 = assemble(inner(sigma - sigI,sigma - sigI)*dx)/sigL2square
+        error_sig_sigI_L2 = sqrt(error_sig_sigI_L2)
+
+        # Print errors
+        print("error_u_L2 =", error_u_L2)
+        print("error_sig_L2 =", error_sig_L2)
+        print("error_sig_Hdiv =", error_sig_Hdiv)
+        print("error_u_uI_L2 =", error_u_uI_L2)
+        print("error_sig_sigI_L2 =", error_sig_sigI_L2)
+        print("error_u_upost_L2=",error_u_upost_L2)
+     
+
+        if kmesh==0 and i==-1:
+            x = np.matrix([kkmesh,para_eta,para_tau,para_gamma,jumpu,error_u_L2,error_sig_L2,error_sig_Hdiv,error_u_uI_L2,error_sig_sigI_L2,error_u_upost_L2, jumpsig])
+            np.savetxt('XGdivdata'+'%d.txt'%names,x,fmt='%s')
+        else:
+            namestxt = 'XGdivdata'+str(names)+'.txt'
+            loaded_data = np.loadtxt(namestxt, dtype=float)
+            x = np.matrix([kkmesh,para_eta,para_tau,para_gamma,jumpu,error_u_L2,error_sig_L2,error_sig_Hdiv,error_u_uI_L2,error_sig_sigI_L2,error_u_upost_L2,jumpsig])
+            xx = np.row_stack((loaded_data,x))
+            np.savetxt('XGdivdata'+'%d.txt'%names,xx,fmt='%s')
+
+        kmesh = kmesh + 1
+    i=i-1
+
