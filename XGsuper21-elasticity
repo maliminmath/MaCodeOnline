@@ -1,0 +1,211 @@
+from dolfin import * 
+import numpy as np
+import numpy 
+import matplotlib.pyplot as plt
+
+list_linear_algebra_backends()
+print(parameters["linear_algebra_backend"])
+list_linear_solver_methods()
+list_krylov_solver_methods()
+list_krylov_solver_preconditioners()
+
+orderk = 3
+names = (orderk+1)*10 + orderk
+
+# Elastic parameters
+para_E  = 1.0
+
+i = -1
+while (i>-2):
+    para_nu = 0.5 - 10**i 
+    para_mu    = para_E / (2.0*(1.0 + para_nu))
+    para_lmbda = para_E*para_nu / ((1.0 + para_nu)*(1.0 - 2.0*para_nu))
+    para_eta = 20
+    para_tau = 0.05
+    para_gamma = 0
+    d = 2
+    
+    uL2square = 1.0
+    uH1square = 3/4*pi**2
+    sigL2square = (para_lmbda**2 + 3*para_mu**2 + 2*para_mu*para_lmbda)*pi**2
+    sigAL2square = 0.5*(para_lmbda + 3*para_mu)*pi**2
+    sigDivsquare = (0.5*(para_lmbda + para_mu)**2 + 2*para_mu**2)*pi**4
+
+    kmesh = 0
+    while (kmesh<8):
+        kkmesh = 2**kmesh
+        mesh = UnitSquareMesh(kkmesh,kkmesh)
+
+        def Asig(sigma):
+            return 1.0 / (2.0 * para_mu )* (sigma - para_lmbda / (2 * para_mu + 2 * para_lmbda) * tr(sigma) * Identity(d))
+
+        # Source terms    
+        uD = Expression(("sin(pi*x[0])*sin(pi*x[1])","sin(pi*x[0])*sin(pi*x[1])"),degree=6)
+        f = Expression(("(lmda + mu)*pi*pi*cos(pi*(x[0]+x[1])) - 2*mu*pi*pi*sin(pi*x[0])*sin(pi*x[1])",\
+                        "(lmda + mu)*pi*pi*cos(pi*(x[0]+x[1])) - 2*mu*pi*pi*sin(pi*x[0])*sin(pi*x[1])"),degree=6,lmda = para_lmbda, mu = para_mu)
+        sigD = Expression((("lmda*pi*sin(pi*(x[0]+x[1])) + 2*mu*pi*cos(pi*x[0])*sin(pi*x[1])","mu*pi*sin(pi*(x[0]+x[1]))"),\
+                           ("mu*pi*sin(pi*(x[0]+x[1]))","lmda*pi*sin(pi*(x[0]+x[1])) + 2*mu*pi*sin(pi*x[0])*cos(pi*x[1])")),degree=6,lmda = para_lmbda, mu = para_mu)
+        base = Expression(("x[1]","-x[0]"),degree = 1)
+
+        # Define function spaces and mixed (product) space
+        Qelem = TensorElement("DG",mesh.ufl_cell(),orderk+1,symmetry=True)
+        Velem = VectorElement("DG",mesh.ufl_cell(),orderk) 
+        element = MixedElement(Qelem, Velem) 
+        W = FunctionSpace(mesh, element)
+        Q = FunctionSpace(mesh, Qelem)
+        V = FunctionSpace(mesh, Velem)
+        n = FacetNormal(mesh)
+        h = CellDiameter(mesh)
+        h_avg = (h('+') + h('-'))/2.0
+
+
+        sigI = project(sigD,Q)
+        uI = project(uD,V)
+
+        # Define Dirichlet boundary (x = 0 or x = 1)
+        def boundary(x):
+            return x[0] < DOLFIN_EPS or x[0] > 1.0 - DOLFIN_EPS
+
+        def epsilon(u):
+            return 0.5*(nabla_grad(u) + nabla_grad(u).T)
+
+        def Cepsilon(u):
+            return para_lmbda*tr(epsilon(u))*Identity(d) + 2*para_mu*epsilon(u)
+        
+        # Define boundary condition
+        u0 = Constant((0.0,0.0)) 
+        
+        # Define trial and test functions
+        (sigma, u) = TrialFunctions(W)
+        (tau, v) = TestFunctions(W) 
+       
+        # Define variational form
+        a1 = (inner(Asig(sigma), tau) + inner(div(tau),u) + inner(div(sigma),v))*dx \
+            - inner(jump(sigma,n),avg(v))*dS - inner(jump(tau,n),avg(u))*dS \
+            - para_tau*h_avg*inner(jump(u), jump(v))*dS - para_tau*h*inner(u,v)*ds
+        aeta = para_eta/h_avg*inner(jump(sigma,n),jump(tau,n))*dS
+        a = a1  + aeta
+        # + para_gamma*inner(jump(sigma,n),jump(v))*dS + para_gamma*inner(jump(tau,n),jump(u))*dS \
+        
+        L = inner(f,v)*dx
+        A, b = assemble_system(a, L) 
+
+        # Compute solution
+        w = Function(W)
+
+        
+        ############################
+        #      Preconditioner      #
+        ############################
+
+        pre = inner(Asig(sigma), tau)*dx + inner(div(sigma),div(tau))*dx \
+              + para_eta/h_avg*inner(jump(sigma,n),jump(tau,n))*dS  + inner(u,v)*dx + para_tau*h_avg*inner(jump(u), jump(v))*dS
+        C, btmp = assemble_system(pre, L)
+
+        
+        print("C is assembled")
+        ###########################################################################
+        #                         Preconditioned MINRES                           #
+        ###########################################################################
+        # clear PETSc options to set up the iterative solver
+        PETScOptions.clear()
+
+        # Setting of a solver
+        solver_type = 'minres'
+        norm_type = 'preconditioned' # minres supports only preconditioned
+        rtol = '1e-8'
+        # PETSc solver options
+        PETScOptions.set("ksp_type", solver_type)
+        PETScOptions.set("pc_type", "lu")
+        PETScOptions.set("ksp_monitor_true_residual")
+        PETScOptions.set("ksp_converged_reason")
+        PETScOptions.set("ksp_view")
+        PETScOptions.set("ksp_rtol", rtol)
+        PETScOptions.set("ksp_norm_type", norm_type)
+        PETScOptions.set("ksp_max_it", "1000")
+
+        # solver initialization 
+        solver = PETScKrylovSolver()
+        solver.set_operators(A,C)
+        solver.set_from_options()
+
+        print("solver is setted")
+        # solve + infrastructure
+        w = Function(W) 
+        solver.solve(w.vector(), b)
+        (sigma, u) = w.split()
+        
+        # Compute error
+        jumpu = assemble(h_avg*inner(jump(u),jump(u))*dS)
+        jumpu = sqrt(jumpu)
+        jumpsig = assemble(1/h_avg*inner(jump(sigma,n),jump(sigma,n))*dS)
+        jumpsig = sqrt(jumpsig)
+
+        error_u_L2 = assemble(inner(uD-u, uD-u)*dx)#errornorm(uD, u,"L2")
+        error_u_L2 = sqrt(error_u_L2)/sqrt(uL2square)
+        
+        error_sig_AL2 = assemble(inner(Asig(sigma - sigD),(sigma - sigD))*dx)
+        error_sig_AL2 = sqrt(error_sig_AL2)/sigAL2square
+        
+        error_sig_L2 = assemble(inner(sigma - sigD,sigma - sigD)*dx)/sigL2square
+        error_sig_L2 = sqrt(error_sig_L2)
+        
+        error_sig_Hdiv = assemble(inner(div(sigma) - f, div(sigma) - f)*dx)/sigDivsquare
+        error_sig_Hdiv = sqrt(error_sig_Hdiv)
+        # error_sig_Hdiv = errornorm(sigma,sigI,"Hdiv")
+
+        error_u_uI_L2 = assemble(inner(uI-u, uI-u)*dx)#errornorm(uI, u,"L2")
+        error_u_uI_L2 = sqrt(error_u_uI_L2)/sqrt(uL2square)
+
+        error_sig_sigI_L2 = assemble(inner(sigma - sigI,sigma - sigI)*dx)/sigL2square
+        error_sig_sigI_L2 = sqrt(error_sig_sigI_L2)
+
+        #############################################
+        #               Postprocess                 #
+        ############################################# 
+        VelemStar = VectorElement("DG",mesh.ufl_cell(),orderk+2)
+        Celem = VectorElement("DG",mesh.ufl_cell(),0)
+        Curlelem = FiniteElement("DG",mesh.ufl_cell(),0)
+        elementStar = MixedElement(VelemStar, Celem, Curlelem) 
+        Vstar = FunctionSpace(mesh, elementStar)
+        (ustar, cstar, estar) = TrialFunctions(Vstar)
+        (vstar, dstar, fstar) = TestFunctions(Vstar)
+        
+        apost5 = inner(epsilon(ustar), epsilon(vstar))*dx  + inner(cstar,vstar)*dx + inner(dstar,ustar)*dx\
+                 + inner(fstar*base,ustar)*dx  + inner(estar*base,vstar)*dx
+        Lpost5 = inner(Asig(sigma), epsilon(vstar))*dx + inner(dstar,u)*dx + inner(fstar*base,u)*dx
+        ww = Function(Vstar)
+
+        
+        solve(apost5 == Lpost5, ww)
+        (ustar,cstar,estar) = ww.split()
+        
+        error_u_upost_L2 = assemble(inner(uD - ustar,uD - ustar)*dx)
+        error_u_upost_L2 = sqrt(error_u_upost_L2)
+
+        aa = assemble(inner(Asig(sigD) - epsilon(ustar), Asig(sigD) - epsilon(ustar))*dx)
+        aa = sqrt(aa)
+
+        
+        # Print errors
+        print("error_u_L2 =", error_u_L2)
+        print("error_u_upost_L2 =", error_u_upost_L2)
+        print("error_sig_Hdiv =", error_sig_Hdiv) 
+        print("eaa=", aa) 
+     
+
+        if kmesh==0 and i==-1:
+            x = np.matrix([kkmesh,para_mu,para_lmbda,para_eta,para_tau,para_gamma,jumpu,error_u_L2,error_u_uI_L2,\
+                           error_u_upost_L2,aa,error_sig_AL2,error_sig_Hdiv,error_sig_L2,error_sig_sigI_L2,jumpsig])
+            np.savetxt('XGdivDG'+'%d.txt'%names,x,fmt='%s')
+        else:
+            namestxt = 'XGdivDG'+str(names)+'.txt'
+            loaded_data = np.loadtxt(namestxt, dtype=float)
+            x = np.matrix([kkmesh,para_mu,para_lmbda,para_eta,para_tau,para_gamma,jumpu,error_u_L2,error_u_uI_L2,\
+                           error_u_upost_L2,aa,error_sig_AL2,error_sig_Hdiv, error_sig_L2,error_sig_sigI_L2,jumpsig])
+            xx = np.row_stack((loaded_data,x))
+            np.savetxt('XGdivDG'+'%d.txt'%names,xx,fmt='%s')
+
+        kmesh = kmesh + 1
+    i=i-1
+
